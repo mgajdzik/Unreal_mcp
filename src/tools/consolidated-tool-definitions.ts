@@ -1412,7 +1412,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_material_authoring',
     category: 'authoring',
-    description: 'Create materials with expressions, parameters, functions, instances, and landscape blend layers.',
+    description: 'Create and inspect materials with expressions, parameters, functions, instances, landscape blend layers, and read material/MF/MPC graphs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1429,7 +1429,8 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'create_material_instance', 'set_scalar_parameter_value', 'set_vector_parameter_value', 'set_texture_parameter_value',
             'create_landscape_material', 'create_decal_material', 'create_post_process_material',
             'add_landscape_layer', 'configure_layer_blend',
-            'compile_material', 'get_material_info'
+            'compile_material', 'get_material_info',
+            'read_material_graph', 'read_material_function', 'read_mpc'
           ],
           description: 'Material authoring action to perform'
         },

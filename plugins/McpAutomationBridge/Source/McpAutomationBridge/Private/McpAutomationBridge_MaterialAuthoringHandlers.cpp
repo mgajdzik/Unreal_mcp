@@ -70,6 +70,7 @@
 #include "Materials/MaterialExpressionDesaturation.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialInstanceConstant.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "UObject/SavePackage.h"
 #include "EditorAssetLibrary.h"
@@ -3081,6 +3082,426 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
     SendAutomationResponse(Socket, RequestId, true,
                            FString::Printf(TEXT("Cast shadows set to %s."), CastShadows ? TEXT("true") : TEXT("false")), Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // read_material_graph — Full expression graph introspection for UMaterial
+  // --------------------------------------------------------------------------
+  if (SubAction == TEXT("read_material_graph")) {
+    FString AssetPath;
+    if (!Payload->TryGetStringField(TEXT("assetPath"), AssetPath) ||
+        AssetPath.IsEmpty()) {
+      SendAutomationError(Socket, RequestId, TEXT("Missing 'assetPath'."),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+
+    FString ValidatedPath = SanitizeProjectRelativePath(AssetPath);
+    if (ValidatedPath.IsEmpty()) {
+      SendAutomationError(Socket, RequestId,
+                          FString::Printf(TEXT("Invalid path '%s'"), *AssetPath),
+                          TEXT("INVALID_PATH"));
+      return true;
+    }
+    AssetPath = ValidatedPath;
+
+    UMaterial* Material = LoadObject<UMaterial>(nullptr, *AssetPath);
+    if (!Material) {
+      SendAutomationError(Socket, RequestId, TEXT("Could not load Material."),
+                          TEXT("ASSET_NOT_FOUND"));
+      return true;
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("assetPath"), AssetPath);
+    Result->SetStringField(TEXT("assetClass"), TEXT("Material"));
+
+    // Domain + blend mode
+    Result->SetStringField(TEXT("domain"),
+        Material->MaterialDomain == EMaterialDomain::MD_Surface ? TEXT("Surface") :
+        Material->MaterialDomain == EMaterialDomain::MD_DeferredDecal ? TEXT("DeferredDecal") :
+        Material->MaterialDomain == EMaterialDomain::MD_PostProcess ? TEXT("PostProcess") :
+        TEXT("Other"));
+    Result->SetBoolField(TEXT("twoSided"), Material->TwoSided);
+
+    // Serialize all expressions
+    TArray<TSharedPtr<FJsonValue>> NodesArray;
+    const auto& Expressions = MCP_GET_MATERIAL_EXPRESSIONS(Material);
+    for (int32 i = 0; i < Expressions.Num(); ++i) {
+      UMaterialExpression* Expr = Expressions[i];
+      if (!Expr) continue;
+
+      TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+      NodeObj->SetNumberField(TEXT("index"), i);
+      NodeObj->SetStringField(TEXT("nodeId"), Expr->MaterialExpressionGuid.ToString());
+      NodeObj->SetStringField(TEXT("class"), Expr->GetClass()->GetName());
+      NodeObj->SetStringField(TEXT("desc"), Expr->GetDescription());
+      NodeObj->SetNumberField(TEXT("x"), Expr->MaterialExpressionEditorX);
+      NodeObj->SetNumberField(TEXT("y"), Expr->MaterialExpressionEditorY);
+
+      // Expression-specific properties
+      if (auto* Param = Cast<UMaterialExpressionParameter>(Expr)) {
+        NodeObj->SetStringField(TEXT("parameterName"), Param->ParameterName.ToString());
+      }
+      if (auto* Scalar = Cast<UMaterialExpressionScalarParameter>(Expr)) {
+        NodeObj->SetNumberField(TEXT("defaultValue"), Scalar->DefaultValue);
+      }
+      if (auto* Vec = Cast<UMaterialExpressionVectorParameter>(Expr)) {
+        TSharedPtr<FJsonObject> DefVal = MakeShared<FJsonObject>();
+        DefVal->SetNumberField(TEXT("r"), Vec->DefaultValue.R);
+        DefVal->SetNumberField(TEXT("g"), Vec->DefaultValue.G);
+        DefVal->SetNumberField(TEXT("b"), Vec->DefaultValue.B);
+        DefVal->SetNumberField(TEXT("a"), Vec->DefaultValue.A);
+        NodeObj->SetObjectField(TEXT("defaultValue"), DefVal);
+      }
+      if (auto* Const1 = Cast<UMaterialExpressionConstant>(Expr)) {
+        NodeObj->SetNumberField(TEXT("value"), Const1->R);
+      }
+      if (auto* Const3 = Cast<UMaterialExpressionConstant3Vector>(Expr)) {
+        TSharedPtr<FJsonObject> Val = MakeShared<FJsonObject>();
+        Val->SetNumberField(TEXT("r"), Const3->Constant.R);
+        Val->SetNumberField(TEXT("g"), Const3->Constant.G);
+        Val->SetNumberField(TEXT("b"), Const3->Constant.B);
+        Val->SetNumberField(TEXT("a"), Const3->Constant.A);
+        NodeObj->SetObjectField(TEXT("value"), Val);
+      }
+      if (auto* Custom = Cast<UMaterialExpressionCustom>(Expr)) {
+        NodeObj->SetStringField(TEXT("code"), Custom->Code);
+        NodeObj->SetStringField(TEXT("outputType"),
+            Custom->OutputType == CMOT_Float1 ? TEXT("Float1") :
+            Custom->OutputType == CMOT_Float2 ? TEXT("Float2") :
+            Custom->OutputType == CMOT_Float3 ? TEXT("Float3") :
+            Custom->OutputType == CMOT_Float4 ? TEXT("Float4") :
+            TEXT("MaterialAttributes"));
+        NodeObj->SetStringField(TEXT("description"), Custom->Description);
+        // Include file paths
+        TArray<TSharedPtr<FJsonValue>> IncPaths;
+        for (const FString& Inc : Custom->IncludeFilePaths) {
+          IncPaths.Add(MakeShared<FJsonValueString>(Inc));
+        }
+        NodeObj->SetArrayField(TEXT("includeFilePaths"), IncPaths);
+        // Additional inputs
+        TArray<TSharedPtr<FJsonValue>> AddInputs;
+        for (const FCustomInput& CI : Custom->Inputs) {
+          TSharedPtr<FJsonObject> CIObj = MakeShared<FJsonObject>();
+          CIObj->SetStringField(TEXT("name"), CI.InputName.ToString());
+          AddInputs.Add(MakeShared<FJsonValueObject>(CIObj));
+        }
+        NodeObj->SetArrayField(TEXT("additionalInputs"), AddInputs);
+      }
+      if (auto* TexSample = Cast<UMaterialExpressionTextureSample>(Expr)) {
+        if (TexSample->Texture) {
+          NodeObj->SetStringField(TEXT("texture"), TexSample->Texture->GetPathName());
+        }
+      }
+      if (auto* MFCall = Cast<UMaterialExpressionMaterialFunctionCall>(Expr)) {
+        if (MFCall->MaterialFunction) {
+          NodeObj->SetStringField(TEXT("functionPath"),
+              MFCall->MaterialFunction->GetPathName());
+        }
+      }
+      if (auto* FuncIn = Cast<UMaterialExpressionFunctionInput>(Expr)) {
+        NodeObj->SetStringField(TEXT("inputName"), FuncIn->InputName.ToString());
+        NodeObj->SetStringField(TEXT("inputType"),
+            FuncIn->InputType == FunctionInput_Scalar ? TEXT("Float1") :
+            FuncIn->InputType == FunctionInput_Vector2 ? TEXT("Float2") :
+            FuncIn->InputType == FunctionInput_Vector3 ? TEXT("Float3") :
+            FuncIn->InputType == FunctionInput_Vector4 ? TEXT("Float4") :
+            FuncIn->InputType == FunctionInput_Texture2D ? TEXT("Texture2D") :
+            TEXT("Other"));
+      }
+      if (auto* FuncOut = Cast<UMaterialExpressionFunctionOutput>(Expr)) {
+        NodeObj->SetStringField(TEXT("outputName"), FuncOut->OutputName.ToString());
+      }
+      if (auto* TexCoord = Cast<UMaterialExpressionTextureCoordinate>(Expr)) {
+        NodeObj->SetNumberField(TEXT("coordinateIndex"), TexCoord->CoordinateIndex);
+        NodeObj->SetNumberField(TEXT("uTiling"), TexCoord->UTiling);
+        NodeObj->SetNumberField(TEXT("vTiling"), TexCoord->VTiling);
+      }
+
+      // Serialize input connections
+      const int32 NumInputs = Expr->CountInputs();
+      if (NumInputs > 0) {
+        TArray<TSharedPtr<FJsonValue>> InputsArr;
+        for (int32 j = 0; j < NumInputs; ++j) {
+          FExpressionInput* Input = Expr->GetInput(j);
+          if (!Input) continue;
+          TSharedPtr<FJsonObject> InObj = MakeShared<FJsonObject>();
+          InObj->SetStringField(TEXT("name"), Expr->GetInputName(j).ToString());
+          if (Input->Expression) {
+            InObj->SetStringField(TEXT("connectedTo"),
+                Input->Expression->MaterialExpressionGuid.ToString());
+            InObj->SetNumberField(TEXT("outputIndex"), Input->OutputIndex);
+          }
+          InputsArr.Add(MakeShared<FJsonValueObject>(InObj));
+        }
+        NodeObj->SetArrayField(TEXT("inputs"), InputsArr);
+      }
+
+      NodesArray.Add(MakeShared<FJsonValueObject>(NodeObj));
+    }
+    Result->SetArrayField(TEXT("nodes"), NodesArray);
+
+    // Serialize main material input connections
+#if WITH_EDITORONLY_DATA
+    TSharedPtr<FJsonObject> MainInputs = MakeShared<FJsonObject>();
+    auto SerializeMainInput = [&](const TCHAR* Name, const FExpressionInput& Input) {
+      if (Input.Expression) {
+        TSharedPtr<FJsonObject> Conn = MakeShared<FJsonObject>();
+        Conn->SetStringField(TEXT("connectedTo"),
+            Input.Expression->MaterialExpressionGuid.ToString());
+        Conn->SetNumberField(TEXT("outputIndex"), Input.OutputIndex);
+        MainInputs->SetObjectField(Name, Conn);
+      }
+    };
+    SerializeMainInput(TEXT("BaseColor"), MCP_GET_MATERIAL_INPUT(Material, BaseColor));
+    SerializeMainInput(TEXT("Metallic"), MCP_GET_MATERIAL_INPUT(Material, Metallic));
+    SerializeMainInput(TEXT("Specular"), MCP_GET_MATERIAL_INPUT(Material, Specular));
+    SerializeMainInput(TEXT("Roughness"), MCP_GET_MATERIAL_INPUT(Material, Roughness));
+    SerializeMainInput(TEXT("EmissiveColor"), MCP_GET_MATERIAL_INPUT(Material, EmissiveColor));
+    SerializeMainInput(TEXT("Normal"), MCP_GET_MATERIAL_INPUT(Material, Normal));
+    SerializeMainInput(TEXT("Opacity"), MCP_GET_MATERIAL_INPUT(Material, Opacity));
+    SerializeMainInput(TEXT("OpacityMask"), MCP_GET_MATERIAL_INPUT(Material, OpacityMask));
+    SerializeMainInput(TEXT("WorldPositionOffset"), MCP_GET_MATERIAL_INPUT(Material, WorldPositionOffset));
+    SerializeMainInput(TEXT("AmbientOcclusion"), MCP_GET_MATERIAL_INPUT(Material, AmbientOcclusion));
+    SerializeMainInput(TEXT("SubsurfaceColor"), MCP_GET_MATERIAL_INPUT(Material, SubsurfaceColor));
+    Result->SetObjectField(TEXT("mainInputs"), MainInputs);
+#endif
+
+    SendAutomationResponse(Socket, RequestId, true,
+                           FString::Printf(TEXT("Material graph read: %d nodes."), Expressions.Num()),
+                           Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // read_material_function — Full expression graph for UMaterialFunction
+  // --------------------------------------------------------------------------
+  if (SubAction == TEXT("read_material_function")) {
+    FString AssetPath;
+    if (!Payload->TryGetStringField(TEXT("assetPath"), AssetPath) ||
+        AssetPath.IsEmpty()) {
+      SendAutomationError(Socket, RequestId, TEXT("Missing 'assetPath'."),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+
+    FString ValidatedPath = SanitizeProjectRelativePath(AssetPath);
+    if (ValidatedPath.IsEmpty()) {
+      SendAutomationError(Socket, RequestId,
+                          FString::Printf(TEXT("Invalid path '%s'"), *AssetPath),
+                          TEXT("INVALID_PATH"));
+      return true;
+    }
+    AssetPath = ValidatedPath;
+
+    UMaterialFunction* Func = LoadObject<UMaterialFunction>(nullptr, *AssetPath);
+    if (!Func) {
+      SendAutomationError(Socket, RequestId,
+                          TEXT("Could not load MaterialFunction."),
+                          TEXT("ASSET_NOT_FOUND"));
+      return true;
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("assetPath"), AssetPath);
+    Result->SetStringField(TEXT("assetClass"), TEXT("MaterialFunction"));
+    Result->SetStringField(TEXT("description"), Func->Description);
+
+    // Get expressions from the function
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+    const auto& FuncExpressions = Func->GetEditorOnlyData()->ExpressionCollection.Expressions;
+#else
+    const auto& FuncExpressions = Func->FunctionExpressions;
+#endif
+
+    TArray<TSharedPtr<FJsonValue>> NodesArray;
+    for (int32 i = 0; i < FuncExpressions.Num(); ++i) {
+      UMaterialExpression* Expr = FuncExpressions[i];
+      if (!Expr) continue;
+
+      TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+      NodeObj->SetNumberField(TEXT("index"), i);
+      NodeObj->SetStringField(TEXT("nodeId"), Expr->MaterialExpressionGuid.ToString());
+      NodeObj->SetStringField(TEXT("class"), Expr->GetClass()->GetName());
+      NodeObj->SetStringField(TEXT("desc"), Expr->GetDescription());
+      NodeObj->SetNumberField(TEXT("x"), Expr->MaterialExpressionEditorX);
+      NodeObj->SetNumberField(TEXT("y"), Expr->MaterialExpressionEditorY);
+
+      // Expression-specific properties (same as read_material_graph)
+      if (auto* Param = Cast<UMaterialExpressionParameter>(Expr)) {
+        NodeObj->SetStringField(TEXT("parameterName"), Param->ParameterName.ToString());
+      }
+      if (auto* Scalar = Cast<UMaterialExpressionScalarParameter>(Expr)) {
+        NodeObj->SetNumberField(TEXT("defaultValue"), Scalar->DefaultValue);
+      }
+      if (auto* Vec = Cast<UMaterialExpressionVectorParameter>(Expr)) {
+        TSharedPtr<FJsonObject> DefVal = MakeShared<FJsonObject>();
+        DefVal->SetNumberField(TEXT("r"), Vec->DefaultValue.R);
+        DefVal->SetNumberField(TEXT("g"), Vec->DefaultValue.G);
+        DefVal->SetNumberField(TEXT("b"), Vec->DefaultValue.B);
+        DefVal->SetNumberField(TEXT("a"), Vec->DefaultValue.A);
+        NodeObj->SetObjectField(TEXT("defaultValue"), DefVal);
+      }
+      if (auto* Const1 = Cast<UMaterialExpressionConstant>(Expr)) {
+        NodeObj->SetNumberField(TEXT("value"), Const1->R);
+      }
+      if (auto* Const3 = Cast<UMaterialExpressionConstant3Vector>(Expr)) {
+        TSharedPtr<FJsonObject> Val = MakeShared<FJsonObject>();
+        Val->SetNumberField(TEXT("r"), Const3->Constant.R);
+        Val->SetNumberField(TEXT("g"), Const3->Constant.G);
+        Val->SetNumberField(TEXT("b"), Const3->Constant.B);
+        Val->SetNumberField(TEXT("a"), Const3->Constant.A);
+        NodeObj->SetObjectField(TEXT("value"), Val);
+      }
+      if (auto* Custom = Cast<UMaterialExpressionCustom>(Expr)) {
+        NodeObj->SetStringField(TEXT("code"), Custom->Code);
+        NodeObj->SetStringField(TEXT("outputType"),
+            Custom->OutputType == CMOT_Float1 ? TEXT("Float1") :
+            Custom->OutputType == CMOT_Float2 ? TEXT("Float2") :
+            Custom->OutputType == CMOT_Float3 ? TEXT("Float3") :
+            Custom->OutputType == CMOT_Float4 ? TEXT("Float4") :
+            TEXT("MaterialAttributes"));
+        NodeObj->SetStringField(TEXT("description"), Custom->Description);
+        TArray<TSharedPtr<FJsonValue>> IncPaths;
+        for (const FString& Inc : Custom->IncludeFilePaths) {
+          IncPaths.Add(MakeShared<FJsonValueString>(Inc));
+        }
+        NodeObj->SetArrayField(TEXT("includeFilePaths"), IncPaths);
+        TArray<TSharedPtr<FJsonValue>> AddInputs;
+        for (const FCustomInput& CI : Custom->Inputs) {
+          TSharedPtr<FJsonObject> CIObj = MakeShared<FJsonObject>();
+          CIObj->SetStringField(TEXT("name"), CI.InputName.ToString());
+          AddInputs.Add(MakeShared<FJsonValueObject>(CIObj));
+        }
+        NodeObj->SetArrayField(TEXT("additionalInputs"), AddInputs);
+      }
+      if (auto* TexSample = Cast<UMaterialExpressionTextureSample>(Expr)) {
+        if (TexSample->Texture) {
+          NodeObj->SetStringField(TEXT("texture"), TexSample->Texture->GetPathName());
+        }
+      }
+      if (auto* MFCall = Cast<UMaterialExpressionMaterialFunctionCall>(Expr)) {
+        if (MFCall->MaterialFunction) {
+          NodeObj->SetStringField(TEXT("functionPath"),
+              MFCall->MaterialFunction->GetPathName());
+        }
+      }
+      if (auto* FuncIn = Cast<UMaterialExpressionFunctionInput>(Expr)) {
+        NodeObj->SetStringField(TEXT("inputName"), FuncIn->InputName.ToString());
+        NodeObj->SetStringField(TEXT("inputType"),
+            FuncIn->InputType == FunctionInput_Scalar ? TEXT("Float1") :
+            FuncIn->InputType == FunctionInput_Vector2 ? TEXT("Float2") :
+            FuncIn->InputType == FunctionInput_Vector3 ? TEXT("Float3") :
+            FuncIn->InputType == FunctionInput_Vector4 ? TEXT("Float4") :
+            FuncIn->InputType == FunctionInput_Texture2D ? TEXT("Texture2D") :
+            TEXT("Other"));
+      }
+      if (auto* FuncOut = Cast<UMaterialExpressionFunctionOutput>(Expr)) {
+        NodeObj->SetStringField(TEXT("outputName"), FuncOut->OutputName.ToString());
+      }
+      if (auto* TexCoord = Cast<UMaterialExpressionTextureCoordinate>(Expr)) {
+        NodeObj->SetNumberField(TEXT("coordinateIndex"), TexCoord->CoordinateIndex);
+        NodeObj->SetNumberField(TEXT("uTiling"), TexCoord->UTiling);
+        NodeObj->SetNumberField(TEXT("vTiling"), TexCoord->VTiling);
+      }
+
+      // Serialize input connections
+      const int32 NumInputs = Expr->CountInputs();
+      if (NumInputs > 0) {
+        TArray<TSharedPtr<FJsonValue>> InputsArr;
+        for (int32 j = 0; j < NumInputs; ++j) {
+          FExpressionInput* Input = Expr->GetInput(j);
+          if (!Input) continue;
+          TSharedPtr<FJsonObject> InObj = MakeShared<FJsonObject>();
+          InObj->SetStringField(TEXT("name"), Expr->GetInputName(j).ToString());
+          if (Input->Expression) {
+            InObj->SetStringField(TEXT("connectedTo"),
+                Input->Expression->MaterialExpressionGuid.ToString());
+            InObj->SetNumberField(TEXT("outputIndex"), Input->OutputIndex);
+          }
+          InputsArr.Add(MakeShared<FJsonValueObject>(InObj));
+        }
+        NodeObj->SetArrayField(TEXT("inputs"), InputsArr);
+      }
+
+      NodesArray.Add(MakeShared<FJsonValueObject>(NodeObj));
+    }
+    Result->SetArrayField(TEXT("nodes"), NodesArray);
+    Result->SetNumberField(TEXT("nodeCount"), FuncExpressions.Num());
+
+    SendAutomationResponse(Socket, RequestId, true,
+                           FString::Printf(TEXT("Material function read: %d nodes."),
+                                           FuncExpressions.Num()),
+                           Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // read_mpc — Read Material Parameter Collection scalar/vector params
+  // --------------------------------------------------------------------------
+  if (SubAction == TEXT("read_mpc")) {
+    FString AssetPath;
+    if (!Payload->TryGetStringField(TEXT("assetPath"), AssetPath) ||
+        AssetPath.IsEmpty()) {
+      SendAutomationError(Socket, RequestId, TEXT("Missing 'assetPath'."),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+
+    FString ValidatedPath = SanitizeProjectRelativePath(AssetPath);
+    if (ValidatedPath.IsEmpty()) {
+      SendAutomationError(Socket, RequestId,
+                          FString::Printf(TEXT("Invalid path '%s'"), *AssetPath),
+                          TEXT("INVALID_PATH"));
+      return true;
+    }
+    AssetPath = ValidatedPath;
+
+    UMaterialParameterCollection* MPC =
+        LoadObject<UMaterialParameterCollection>(nullptr, *AssetPath);
+    if (!MPC) {
+      SendAutomationError(Socket, RequestId,
+                          TEXT("Could not load MaterialParameterCollection."),
+                          TEXT("ASSET_NOT_FOUND"));
+      return true;
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("assetPath"), AssetPath);
+    Result->SetStringField(TEXT("assetClass"), TEXT("MaterialParameterCollection"));
+
+    TArray<TSharedPtr<FJsonValue>> ScalarArr;
+    for (const FCollectionScalarParameter& SP : MPC->ScalarParameters) {
+      TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+      Obj->SetStringField(TEXT("name"), SP.ParameterName.ToString());
+      Obj->SetNumberField(TEXT("defaultValue"), SP.DefaultValue);
+      Obj->SetStringField(TEXT("id"), SP.Id.ToString());
+      ScalarArr.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+    Result->SetArrayField(TEXT("scalarParameters"), ScalarArr);
+
+    TArray<TSharedPtr<FJsonValue>> VectorArr;
+    for (const FCollectionVectorParameter& VP : MPC->VectorParameters) {
+      TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+      Obj->SetStringField(TEXT("name"), VP.ParameterName.ToString());
+      TSharedPtr<FJsonObject> DefVal = MakeShared<FJsonObject>();
+      DefVal->SetNumberField(TEXT("r"), VP.DefaultValue.R);
+      DefVal->SetNumberField(TEXT("g"), VP.DefaultValue.G);
+      DefVal->SetNumberField(TEXT("b"), VP.DefaultValue.B);
+      DefVal->SetNumberField(TEXT("a"), VP.DefaultValue.A);
+      Obj->SetObjectField(TEXT("defaultValue"), DefVal);
+      Obj->SetStringField(TEXT("id"), VP.Id.ToString());
+      VectorArr.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+    Result->SetArrayField(TEXT("vectorParameters"), VectorArr);
+
+    SendAutomationResponse(Socket, RequestId, true,
+                           FString::Printf(TEXT("MPC read: %d scalar, %d vector params."),
+                                           MPC->ScalarParameters.Num(),
+                                           MPC->VectorParameters.Num()),
+                           Result);
     return true;
   }
 

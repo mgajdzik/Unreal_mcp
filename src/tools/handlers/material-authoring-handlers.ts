@@ -860,6 +860,62 @@ export async function handleMaterialAuthoringTools(
         return ResponseFactory.success(res, res.message ?? 'Material info retrieved');
       }
 
+      // ===== 8.5b Read-only Graph Introspection =====
+
+      case 'read_material_graph': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['materialPath'], required: true },
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+
+        const res = (await executeAutomationRequest(tools, TOOL_ACTIONS.MANAGE_MATERIAL_AUTHORING, {
+          subAction: 'read_material_graph',
+          assetPath,
+        })) as AutomationResponse;
+
+        if (res.success === false) {
+          return ResponseFactory.error(res.error ?? 'Failed to read material graph', res.errorCode);
+        }
+        return ResponseFactory.success(res, res.message ?? 'Material graph read');
+      }
+
+      case 'read_material_function': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['functionPath'], required: true },
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+
+        const res = (await executeAutomationRequest(tools, TOOL_ACTIONS.MANAGE_MATERIAL_AUTHORING, {
+          subAction: 'read_material_function',
+          assetPath,
+        })) as AutomationResponse;
+
+        if (res.success === false) {
+          return ResponseFactory.error(res.error ?? 'Failed to read material function', res.errorCode);
+        }
+        return ResponseFactory.success(res, res.message ?? 'Material function read');
+      }
+
+      case 'read_mpc': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['mpcPath'], required: true },
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+
+        const res = (await executeAutomationRequest(tools, TOOL_ACTIONS.MANAGE_MATERIAL_AUTHORING, {
+          subAction: 'read_mpc',
+          assetPath,
+        })) as AutomationResponse;
+
+        if (res.success === false) {
+          return ResponseFactory.error(res.error ?? 'Failed to read MPC', res.errorCode);
+        }
+        return ResponseFactory.success(res, res.message ?? 'MPC read');
+      }
+
       // ===== 8.6 Aliases and Additional Actions =====
 
       // Alias: add_material_node -> add_math_node
@@ -1039,7 +1095,7 @@ export async function handleMaterialAuthoringTools(
 
       default:
         return ResponseFactory.error(
-          `Unknown material authoring action: ${action}. Available actions: create_material, set_blend_mode, set_shading_model, add_texture_sample, add_scalar_parameter, add_vector_parameter, add_math_node, connect_nodes, create_material_instance, set_scalar_parameter_value, set_vector_parameter_value, set_texture_parameter_value, compile_material, get_material_info`,
+          `Unknown material authoring action: ${action}. Available actions: create_material, set_blend_mode, set_shading_model, add_texture_sample, add_scalar_parameter, add_vector_parameter, add_math_node, connect_nodes, create_material_instance, set_scalar_parameter_value, set_vector_parameter_value, set_texture_parameter_value, compile_material, get_material_info, read_material_graph, read_material_function, read_mpc`,
           'UNKNOWN_ACTION'
         );
     }
