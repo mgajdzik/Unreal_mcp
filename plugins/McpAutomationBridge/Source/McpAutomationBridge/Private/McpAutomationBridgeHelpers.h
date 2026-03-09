@@ -267,28 +267,16 @@ static inline FString SanitizeProjectRelativePath(const FString &InPath) {
     CleanPath = TEXT("/") + CleanPath;
   }
 
-  // Whitelist valid roots - MUST start with one of these
-  const bool bValidRoot = CleanPath.StartsWith(TEXT("/Game")) ||
-                          CleanPath.StartsWith(TEXT("/Engine")) ||
-                          CleanPath.StartsWith(TEXT("/Script"));
-
-  // Reject paths that start with / but don't have a valid root
-  // This catches paths like /etc/passwd or /invalid/path
-  if (!bValidRoot) {
-    // Check if it looks like a plugin path (e.g., /MyPlugin/Content/Asset)
-    // Plugin paths must have at least 3 segments: /PluginName/Content/...
-    TArray<FString> Segments;
-    CleanPath.ParseIntoArray(Segments, TEXT("/"), true);
-    const bool bLooksLikePluginPath = Segments.Num() >= 3 &&
-        Segments.Num() >= 2 && Segments[1].Equals(TEXT("Content"), ESearchCase::IgnoreCase);
-    
-    if (!bLooksLikePluginPath) {
-      UE_LOG(
-          LogMcpAutomationBridgeSubsystem, Warning,
-          TEXT("SanitizeProjectRelativePath: Rejected path without valid root (not /Game, /Engine, /Script, or valid plugin path): %s"),
-          *InPath);
-      return FString();
-    }
+  // Validate against the engine's registered mount points.
+  // FPackageName::IsValidLongPackageName checks /Game, /Engine, /Script, and all
+  // plugin content roots (e.g., /MyPlugin/). This is platform-independent and
+  // automatically covers any mounted content path without a manual whitelist.
+  if (!FPackageName::IsValidLongPackageName(CleanPath)) {
+    UE_LOG(
+        LogMcpAutomationBridgeSubsystem, Warning,
+        TEXT("SanitizeProjectRelativePath: Rejected path '%s' — not a valid UE package path (no matching mount point)"),
+        *InPath);
+    return FString();
   }
 
   return CleanPath;
@@ -466,11 +454,9 @@ static inline bool ValidateAssetCreationPath(
     return false;
   }
   
-  // Ensure folder starts with valid root
-  if (!SanitizedFolder.StartsWith(TEXT("/Game")) && 
-      !SanitizedFolder.StartsWith(TEXT("/Engine")) &&
-      !SanitizedFolder.StartsWith(TEXT("/Script"))) {
-    SanitizedFolder = TEXT("/Game") + SanitizedFolder;
+  // Ensure folder starts with valid root (prepend /Game only if no UE root at all)
+  if (!SanitizedFolder.StartsWith(TEXT("/"))) {
+    SanitizedFolder = TEXT("/Game/") + SanitizedFolder;
   }
   
   // Sanitize asset name

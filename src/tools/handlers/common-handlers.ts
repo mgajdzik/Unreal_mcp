@@ -11,44 +11,55 @@ export function ensureArgsPresent(args: unknown): asserts args is Record<string,
 }
 
 /**
+ * Check if a string looks like a valid Unreal Engine content path.
+ * Valid UE paths: /Game/..., /Engine/..., /Script/..., /MyPlugin/...
+ * The first segment must be a simple identifier (alphanumeric + underscore).
+ * The C++ side does the authoritative check via FPackageName::IsValidLongPackageName.
+ */
+function isValidUEContentPath(value: string): boolean {
+  // Must start with /Identifier
+  const match = value.match(/^\/([A-Za-z_][A-Za-z0-9_]*)(\/|$)/);
+  return match !== null;
+}
+
+/**
  * Security validation: Check for path traversal attempts and blocked patterns.
  * Returns an error message if validation fails, undefined if validation passes.
+ *
+ * Strategy: reject structurally invalid paths (traversal, drive letters, backslashes).
+ * The C++ plugin side validates against the engine's actual mount points, so the
+ * TypeScript layer only needs to catch obviously malformed input.
  */
 export function validateSecurityPatterns(args: Record<string, unknown>): string | undefined {
-  // Path traversal patterns to block
-  const traversalPatterns = [
-    '../',           // Unix parent directory
-    '..\\',          // Windows parent directory
-    '/etc/',         // Unix system directory
-    '\\Windows\\',   // Windows system directory
-    '\\Program Files', // Windows program files
-  ];
-  
-  // Check all string arguments for traversal patterns
   for (const [key, value] of Object.entries(args)) {
-    if (typeof value === 'string') {
-      const lowerValue = value.toLowerCase();
-      for (const pattern of traversalPatterns) {
-        if (value.includes(pattern) || lowerValue.includes(pattern.toLowerCase())) {
-          return `Security violation: '${key}' contains blocked path pattern. Path traversal is not allowed.`;
-        }
+    if (typeof value !== 'string') {
+      continue;
+    }
+
+    // Block path traversal in any argument
+    if (value.includes('..')) {
+      return `Security violation: '${key}' contains path traversal sequence '..'`;
+    }
+
+    // For path-like arguments, enforce UE content path structure
+    if (key.toLowerCase().includes('path')) {
+      // Block Windows drive letters (C:\, D:/, etc.)
+      if (/^[A-Za-z]:/.test(value)) {
+        return `Security violation: '${key}' contains a drive letter. Only Unreal Engine content paths are allowed.`;
       }
-      
-      // Additional check for paths starting with / (could be absolute system paths)
-      // Allow /Game/, /Engine/, /Script/, /Temp/ as they are UE paths
-      // Also allow exact matches like /Game, /Engine (without trailing slash)
-      if (key.toLowerCase().includes('path') && value.startsWith('/')) {
-        const allowedPrefixes = ['/Game/', '/Engine/', '/Script/', '/Temp/'];
-        const exactAllowed = ['/Game', '/Engine', '/Script', '/Temp'];
-        const isAllowed = allowedPrefixes.some(prefix => value.startsWith(prefix)) ||
-                          exactAllowed.includes(value);
-        if (!isAllowed) {
-          return `Security violation: '${key}' uses unauthorized absolute path. Only /Game/, /Engine/, /Script/, and /Temp/ paths are allowed.`;
-        }
+
+      // Block backslashes (not valid in UE content paths)
+      if (value.includes('\\')) {
+        return `Security violation: '${key}' contains backslashes. Use forward slashes for Unreal Engine content paths.`;
+      }
+
+      // If it starts with /, verify it looks like a UE content path (not a filesystem path)
+      if (value.startsWith('/') && !isValidUEContentPath(value)) {
+        return `Security violation: '${key}' is not a valid Unreal Engine content path. Path must start with /Identifier (e.g., /Game/, /Engine/, /MyPlugin/).`;
       }
     }
   }
-  
+
   return undefined;
 }
 
